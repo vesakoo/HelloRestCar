@@ -2,21 +2,17 @@
 Requirements:
 
 Arduino Uno R3
-
 Elecrow ACS17101S - Wifi Shield based on RN171 module.
-
 4tronix Initio 4WD Robocar
-
 Library:  https://github.com/Seeed-Studio/WiFi_Shield.git
 
 Modify WiFlyClieng.h to use:
 
 #define PIN_TX			5
-
 #define PIN_RX			6
-
 By default Elecrow wifi uses ports 2 & 3
 
+Add SSID.h with your ssid information:
 #define SSID      "Your gateway id"
 #define KEY       "Your gateway WPA pass"
 
