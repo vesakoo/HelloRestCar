@@ -1,21 +1,12 @@
 # HelloRestCar
 Requirements:
 
-Arduino Uno R3
-
-Elecrow ACS17101S - Wifi Shield based on RN171 module.
+Arduino Uno WiFi REV2
 
 4tronix Initio 4WD Robocar
 
-Library:  https://github.com/Seeed-Studio/WiFi_Shield.git
+Library:  WiFiNINA, NewPing
 
-Modify WiFlyClieng.h to use:
-
-#define PIN_TX			5
-
-#define PIN_RX			6
-
-By default Elecrow wifi uses ports 2 & 3
 
 Add SSID.h with your ssid information:
 

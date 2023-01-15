@@ -1,134 +1,424 @@
-/**
- * First version of using http rest api requests to control
- * two Motors with L293D encoder
- * 4 pwm pins in use, each connected to L293D in1-in4
- * en1 and en2 are enabled with circuit jumper.
- *  Lib: https://github.com/Seeed-Studio/WiFi_Shield.git
- *  HW: 
- *      Elecrow ACS17101S - Wifi Shield based on RN171 module.
- *       
- *      4tronix Initio 4WD ROBOALUSTA	
-*/
- 
 #define DEBUG true
 #include <Arduino.h>
-#include <SoftwareSerial.h>
-#include <WiFly.h>
-#include "HTTPClient.h"
+#include <NewPing.h>
+#define DEBUG true
+#include <string.h>
+#include <SPI.h>
+#include <WiFiNINA.h>
+#include "SSID.h"
+///////please enter your sensitive data in the Secret tab/arduino_secrets.h
+
+
+#define TRIGGER_PIN_FRONT  11  // Arduino pin tied to trigger pin on the ultrasonic sensor.
+#define ECHO_PIN_FRONT     12  // Arduino pin tied to echo pin on the ultrasonic sensor.
+#define MAX_DISTANCE 400 // Maximum distance we want to ping for (in centimeters). Maximum sensor distance is rated at 400-500cm.
+#define TRIGGER_PIN_REAR  18 
+#define ECHO_PIN_REAR 19
+//#include "HTTPClient.h"
 #include <string.h>
 #include "SSID.h"
+#define BEHOST "robo.sukelluspaikka.fi"
+#define HTTP_MAX_BUF_LEN  130
+#define MAX_DIST_CM 150
+#define MANUAL_MODE_MAXDUR  300000l
+#define ACTION_TIMEOUT 10000l
+#define LED_RED 7
+#define LED_YELLOW 6
+#define LED_GREEN 5
+/// wifi params
 
-
-
-#define ACTION_TTL (unsigned long) 15000
-// WIFLY_AUTH_OPEN / WIFLY_AUTH_WPA1 / WIFLY_AUTH_WPA1_2 / WIFLY_AUTH_WPA2_PSK
-#define AUTH      WIFLY_AUTH_WPA2_PSK
-
-
-// Pins' connection
-// Arduino       WiFly
-//  2    <---->    TX
-//  3    <---->    RX
-SoftwareSerial uart(5, 6);
-WiFly wifly(uart);
-HTTPClient http;
-char get;
-char twenty [20];
+//HTTPClient http;
+char twenty [50];
 String action ="";
 int actionNum =0;
 unsigned long actionStarted = 0;
 bool seqEndReported = false;
 bool manualMode = false;
+long manualModeStartTime =0;
+
+bool send =true;
+
+IPAddress server(192,168,32,87); 
+//WiFiSSLClient client;
+WiFiClient client;
+int status = WL_IDLE_STATUS;
+int lastDirection =0; //0rot or stop, 1 fwd,2 bwd
+
+/**
+ * Sonar
+*/
+NewPing sonarFront(TRIGGER_PIN_FRONT, ECHO_PIN_FRONT, MAX_DISTANCE);
+NewPing sonarRear(TRIGGER_PIN_REAR, ECHO_PIN_REAR, MAX_DISTANCE);
+
+bool trafficLight(bool isFront =false, bool accurate =false){
+  int sonar_cm = 0;
+  if(isFront){
+    sonar_cm = (int) sonarFront.ping_cm();
+    log("Sonar front:" + (String) sonar_cm + " cm");
+  }else{
+    sonar_cm = (int) sonarRear.ping_cm();
+    log("Sonar back:" + (String) sonar_cm + " cm");
+  }
+  
+  
+
+  digitalWrite(LED_GREEN,LOW);
+  digitalWrite(LED_YELLOW,LOW);
+  digitalWrite(LED_RED,LOW);
+  if(sonar_cm >0 && sonar_cm < 20){
+    digitalWrite(LED_RED,HIGH);
+    return true;
+  }else if (sonar_cm >0 && sonar_cm < 100){
+    digitalWrite(LED_YELLOW,HIGH);
+  }else{
+    digitalWrite(LED_GREEN,HIGH);
+  }
+  return false;
+  
+}
+
+/************
+ * Motor
+ */
+
+const byte MOTOR_A = 3;  // Motor 1 Interrupt Pin - INT 1 - LEFT Motor (patterit eessä)
+const byte MOTOR_B = 2;  // Motor 2 Interrupt Pin - INT 0 - RIGHT Motor
+const byte MOTOR_ADIR = 8;
+const byte MOTOR_B_DIR =4;
+// Constant for steps in disk
+const float stepcount = 20.00;  // 20 Slots in disk, change if different
+
+// Constant for wheel diameter
+const float wheeldiameter = 66.10; // Wheel diameter in millimeters, change if different
+
+// Integers for pulse counters
+volatile int counter_A = 0;
+volatile int counter_B = 0;
+
+
+// Motor A
+
+int enA = 10; //A on vasen puoli kun patterit edessä
+int in1 = 14; //high --> taakse
+int in2 = 15; //high --> eteen
+
+// Motor B
+
+int enB = 9;
+int in3 = 16;
+int in4 = 17;
+
+// Motor A pulse count ISR
+void ISR_countA()  
+{
+  counter_A++;  // increment Motor A counter value
+} 
+
+// Motor B pulse count ISR
+void ISR_countB()  
+{
+  counter_B++;  // increment Motor B counter value
+  
+}
+// Function to convert from centimeters to steps
+int CMtoSteps(float cm) {
+
+  int result;  // Final calculation result
+  float circumference = 19.47; //(wheeldiameter * 3.14) / 10; // Calculate wheel circumference in cm
+  float cm_step = circumference / stepcount;  // CM per Step
+  
+  float f_result = cm / cm_step;  // Calculate result as a float
+  result = (int) f_result; // Convert to an integer (note this is NOT rounded)
+  
+  return result;  // End and return result
+
+}
+
+
+void MoveForward(int mspeed) {
+  counter_A = 0;  //  reset counter A to zero
+  counter_B = 0;  //  reset counter B to zero
+
+  trafficLight((mspeed>0),true);
+  if(mspeed>0){ //update global
+    lastDirection =1;
+  }else{
+    lastDirection =2;
+  }
+
+  uint8_t dir1=mspeed<0?LOW:HIGH;
+  uint8_t dir2=mspeed<0?HIGH:LOW;
+  mspeed=mspeed<0?-1*mspeed:mspeed;
+  
+  // Set Motor A direction
+   digitalWrite(in1, dir1);
+   digitalWrite(in2, dir2);
+   // Set Motor B direction
+   digitalWrite(in3, dir1);
+   digitalWrite(in4, dir2);
+
+   analogWrite(enA, mspeed);
+   analogWrite(enB, mspeed);
+
+
+}
+
+// Function to Move Forward
+void MoveForward(int steps, int mspeed) 
+{
+  
+   
+   //uint8_t dir1=steps<0||mspeed<0?LOW:HIGH;
+   //uint8_t dir2=steps<0||mspeed<0?HIGH:LOW;
+
+   mspeed=steps<0?-1*mspeed:mspeed;
+   steps=steps<0?-1*steps:steps;
+
+   bool isForward = mspeed>0;
+   MoveForward(mspeed); 
+   mspeed = isForward?mspeed:-1*mspeed;
+   /*mspeed=mspeed<0?-1*mspeed:mspeed;
+   // Set Motor A direction
+   digitalWrite(in1, dir1);
+   digitalWrite(in2, dir2);
+
+   // Set Motor B direction
+   digitalWrite(in3, dir1);
+   digitalWrite(in4, dir2);*/
+   
+   // Go forward until step value is reached
+   while (steps > counter_A && steps > counter_B) {
+    bool shouldStop = trafficLight(isForward,false);
+    if(shouldStop){
+      break;
+    }
+    if (steps > counter_A) {
+      analogWrite(enA, mspeed);
+    } else {
+      analogWrite(enA, 0);
+    }
+    if (steps > counter_B) {
+      analogWrite(enB, mspeed);
+    } else {
+      analogWrite(enB, 0);
+    }
+   }
+    
+  stopMotors();
+
+}
+
+/**
+ * unlimited curving movement
+ */
+
+void moveLR(int speedL,int speedR){
+  counter_A = 0;  //  reset counter A to zero
+  counter_B = 0;  //  reset counter B to zero
+
+  uint8_t dir1L=speedL<0?LOW:HIGH;
+  uint8_t dir2L=speedL<0?HIGH:LOW;
+  uint8_t dir1R=speedR<0?LOW:HIGH;
+  uint8_t dir2R=speedR<0?HIGH:LOW;
+
+  
+  if(speedL>0 &&speedR>0){
+    trafficLight(true,true);
+    lastDirection=1;
+  }else if(speedL<0 && speedR <0){
+    trafficLight(false,true);
+    lastDirection=2;
+  }
+
+
+  speedL=speedL<0?-1*speedL:speedL;
+  speedR=speedR<0?-1*speedR:speedR; 
+
+  
+
+  // Set Motor A direction
+  digitalWrite(in1, dir1L);
+  digitalWrite(in2, dir2L);
+
+  // Set Motor B direction
+  digitalWrite(in3, dir1R);
+  digitalWrite(in4, dir2R);
+
+  analogWrite(enA, speedL);
+  analogWrite(enB, speedR);
+
+}
+
+//todo? nopeuserolla painotettu keskiarvo stepseistä
+//molemmille puolille oma stepluku
+void moveLRD(int speedL,int speedR, int steps){
+ 
+
+  bool isRotation =(speedL>0 && speedR<0 ) || (speedL<0 && speedR>0) || (speedL==0 && speedR !=0) || (speedR==0 && speedR !=0);
+
+  bool isFwd = (speedL>0 && speedR>0 && steps >0)|| (speedL<0 && speedR<0 && steps <0);
+
+  speedL=steps<0?-1*speedL:speedL;
+  speedR=steps<0?-1*speedR:speedR;
+
+  moveLR(speedL, speedR);
+
+  steps=steps<0?-1*steps:steps;
+  
+
+  
+  
+  // Go forward until step value is reached
+  while (steps > counter_A && steps > counter_B) {
+    if(!isRotation){
+      bool shoudlStop = trafficLight(isFwd,false);
+      if(shoudlStop){
+        break;
+      }
+    }
+    delay(1);    
+  }
+
+  stopMotors();
+
+
+}
+
+void stopMotors(){
+  digitalWrite(enA, LOW);
+  digitalWrite(enB, LOW);
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  counter_A = 0;  //  reset counter A to zero
+  counter_B = 0;  //  reset counter B to zero 
+  lastDirection =0;
+}
+
+
+
+////////////////////////////////////////////////////////////////
+
 
 void setupWifi(){
-  /*while(!Serial.available()){
-    delay(1);
-  }*/
-  Serial.println("------- WIFLY HTTP --------");
-  uart.begin(9600);         // WiFly UART Baud Rate: 9600
-  // Wait WiFly to init
-  //  delay(3000);
-  // check if WiFly is associated with AP(SSID)
-  if (!wifly.isAssociated(SSID)) {
-    while (!wifly.join(SSID, KEY, AUTH)) {
-      Serial.println("Failed to join " SSID);
-      Serial.println("Wait 0.1 second and try again...");
-      delay(100);
-    }
-    wifly.save();    // save configuration, 
+  while (status != WL_CONNECTED) {
+    status = WiFi.begin(SECRET_SSID, SECRET_PASS);
+    delay(10000);
   }
-
+  client.setTimeout(3000);
+  printWiFiStatus();
 }
+
 
 void postSeqEnd(){
-    //const String url = "http://192.168.32.87:3002/seq/1/end";
-    const String url = "http://robo.sukelluspaikka.fi/seq/1/end";
-    int str_len = url.length() + 1;
-    char char_array[str_len];
-    url.toCharArray(char_array, str_len);
-    http.post(char_array,"{\"seq\":\"end\"}",10000);
+    while(!client.connect(server, 3002)){
+      log("Failed to connect");
+      delay(100);
+    }
     
-
+    client.println("POST /seq/1/end HTTP/1.1\r\nHost: 192.168.32.87\r\nConnection: close\r\n");
+    client.println("Content-Length: 13\r\nContent-Type: application/json\r\n\r\n");
+    client.println("{\"seq\":\"end\"}");
+    client.stop();
  }
 
-int  getRestAction(int num, uint8_t *twenty){
-  log("getRestAction(int" +(String) num +")");
-   //seqEndReported = false;
-  char headerStop [4];
-  
-  int counter =0;
-  //String url = "http://192.168.32.87:3002/caction/" +(String)num;
-  String url = "http://robo.sukelluspaikka.fi/caction/" +(String)num;
-  int str_len = url.length() + 1;
-  char char_array[str_len];
-  url.toCharArray(char_array, str_len);
-  Serial.println("\r\nTry to get url - " + url);
-  //Serial.println("------------------------------");
-  while (http.get(char_array, 30000) < 0) {
-    delay(500);
-  }
-  //wifly.readString()
-  while (wifly.receive((uint8_t *)&get, 1, 1000) == 1) {
-    //Serial.print(get);
-    if(
-      headerStop[0]=='\r' &&
-      headerStop[1]=='\n' &&
-      headerStop[2]=='\r' &&
-      headerStop[3]=='\n' 
-    ){
-      if(get!='\0'){ 
-        for (int i = 1;i< 20+1;i++){
-          twenty[i-1] =twenty[i];
-        }
-        twenty[19]=get;
-      }
-     
-    }else{
-      for (int i = 1;i< 4;i++){
-        headerStop[i-1] =headerStop[i];
-      }
-      headerStop[3]=get;
-    } 
-
-  }
-  
-  for (int i=0; i< 20;i++){
-    if(twenty[i]=='/'){
-      return i;
+int simpleREstAction(int num,uint8_t *twenty){
+  long http_start = millis();
+    while (!client.connect(server, 3002)) {
+      delay(100);
     }
-  }
-  return 20;
+      Serial.println("connected to server");
+      memset(twenty, 0, sizeof(twenty));
+      //memset()
+      String s = "GET /caction/" + (String)num+" HTTP/1.1";
+      //log(s);
+      int str_len = s.length() + 1;
+      char char_array[str_len];
+      s.toCharArray(char_array, str_len);
+      client.println(char_array);
+      client.println("Content-Type: text/plain");
+      client.println("Connection: close");
+      client.println();
+      long timeout = 10000;
+      long start = millis();
+      long lasted = millis()-http_start;
+      //log("Connection took: ");
+      //Serial.print(lasted,DEC);
+      //Serial.print(" ms\n");
+      while(!client.available() && start+timeout >millis()){
+        delay(10);
+      }
+      while (client.available() ) {
+        char get = client.read();
+        //client.readString()
+        //Serial.write(get);
+        //client.readString()
+        //if(get!='\0'){ 
+          for (int i = 1;i< 50;i++){
+            twenty[i-1] =twenty[i];
+          }
+          twenty[49]=get;
+        //}
+      }
+      for (int i = 1;i< 50;i++){
+        twenty[i-1] =twenty[i];
+      }
+      twenty[49]='$';
 
 
-  //while(!Wifly.connect("192.168.32.87","3002")); 
-  //snprintf (s, sizeof s, " %6d cnt", num);
-  //Wifly.writeToSocket(char_array);
-  //Wifly.print((char)num);
-  //Wifly.writeToSocket(" HTTP/1.0\r\n");
-  //Wifly.writeToSocket("\r\n");
-  //Wifly.sendCommand(char_array,"*CLOS*");
-}
+      Serial.write('|');
+       client.flush();
+      client.stop();
+     
+      /*for (int i = 0; i < 49; i++)
+      {
+        twenty[i+1]=twenty[i]; 
+      }*/
+      
+      //Serial.write(twenty);
+      //lasted = millis()- http_start;
+      //log("Parsing took") ;
+      //Serial.println(lasted,DEC); 
+      for (int i=0; i< 50;i++){
+        if(twenty[i]=='/'){
+          return i;
+        }
+      }
+      return 50;
+ }
 
+
+
+ /*void simplerRest(int num){
+    while (!client.connect(server, 3002)) {
+    }
+    String s = "GET /caction/" + (String)num+" HTTP/1.1";
+    int str_len = s.length() + 1;
+    char char_array[str_len];
+    s.toCharArray(char_array, str_len);
+    client.println(char_array);
+    client.println("Content-Type: text/plain");
+    client.println("Connection: close");
+    client.println(); 
+    long timeout = 10000;
+    long start = millis();
+    while(!client.available() && start+timeout >millis()){
+      delay(10);
+    }
+    //memset(twenty,'\0', sizeof(twenty));
+    
+    while (client.available() ) {
+      //client.findUntil("","\r\n\r\n");
+      client.findUntil( twenty,"$");
+    }
+    for (int i = 0; i < 50; i++)
+    {
+      Serial.write(twenty[i]);
+    }
+    
+    //Serial.print((String)twenty);
+ }*/
 void log(String msg){
   //if(Serial.available()){
     Serial.println(msg);
@@ -137,286 +427,238 @@ void log(String msg){
 
 
 
+void test(){
+  //log("Front:");
+  //Serial.print(sonarFront.ping_cm());
+  //log("Rear");
+  //Serial.print(sonarRear.ping_cm());
 
-/*******************CAR *****************/
-
-int M_ENA_A=9, M_ENA_B=10;
-int M_A1=14, M_A2=15,M_B1=16,M_B2=17;//A=left, B=rigth
-
-int DA0 = 2, DA1 = 4, DB0 = 3, DB1 = 8; // Pins for Right and Left encoders. DL0 and DR0 must be Interrupts
-int aStat0, aStat1, bStat0, bStat1;
-int apos = 0, bpos = 0;  // variables keeping count of the pulses on each side
-String dir = "None";
-
-void initCar(){
-  pinMode(M_ENA_A, OUTPUT);     
-  pinMode(M_ENA_B, OUTPUT);     
-  pinMode(M_A1, OUTPUT);     
-  pinMode(M_A2, OUTPUT);
-  pinMode(M_B1, OUTPUT);
-  pinMode(M_B2, OUTPUT);
-}
-
-void rampUp(int from, int to, unsigned int pin1,int pin2){
-  for (int i = from; i < to; i++)
-  {
-    analogWrite(pin1,i);
-    analogWrite(pin2,i);
-   delay(10);
-  }
-}
-
-void rampDown(int from, int to, unsigned int pin1, int pin2){
-  for (int i = from; i > to; i--)
-  {
-    if(i%2){
-      analogWrite(pin1,i);
-      analogWrite(pin2,i);
-    }else{
-      analogWrite(pin2,i);
-      analogWrite(pin1,i);
-    }
-    delay(10);
-  }
-  digitalWrite(pin1,LOW);
-  digitalWrite(pin2,LOW);
-}
-
-void breakMotor(){
-  log("breakMotor()");
-  digitalWrite(M_ENA_A,LOW);
-  digitalWrite(M_ENA_B,LOW);
-  digitalWrite(M_A1,LOW);
-  digitalWrite(M_A2,LOW);
-  digitalWrite(M_B1,LOW);
-  digitalWrite(M_B2,LOW);
-  
-}
-
-void fwd(unsigned int speed){
-  log("left()");
-  breakMotor();
-  analogWrite(M_ENA_A,speed);
-  analogWrite(M_ENA_B,speed);
-  digitalWrite(M_A1,HIGH);
-  digitalWrite(M_A2,LOW);
-  digitalWrite(M_B1,LOW);
-  digitalWrite(M_B2,HIGH);
+  digitalWrite(in1,LOW);
+  digitalWrite(in2,LOW);
+  digitalWrite(in3,LOW);
+  digitalWrite(in4,LOW);
+  digitalWrite(enA,LOW);
+  digitalWrite(enB,LOW);  
+//fwd left
+  digitalWrite(in1,HIGH);
+  digitalWrite(in2,LOW);
+  digitalWrite(enA,HIGH);
+  delay(3000);
+  //bwd left
+  digitalWrite(in1,LOW);
+  digitalWrite(in2,HIGH);
+  digitalWrite(enA,HIGH);
+  delay(3000);
+  //fwd left
+  moveLR(130,0);
+delay(3000);  
+    moveLR(0,130); //fwd right
+  delay(3000);
+    moveLR(-130,0);//bwd left
+delay(3000);
+moveLR(0,-130); //bwd right
+stopMotors();
+//MoveForward(130,130);//fwd 130 steps
+  //MoveForward(200);
+  //delay(3000);
+  //MoveForward(-200);
+  //moveLR(120,120);
+  //moveLR(110,150,100);
+  //moveLR(110,154,100);
+  //moveLR(110,170,100);
+  //moveLR(-100,100,60);
 
 }
 
-void rew(unsigned int speed){
-  log("right()");
-  breakMotor();
-  analogWrite(M_ENA_A,speed);
-  analogWrite(M_ENA_B,speed);
-  digitalWrite(M_A1,LOW);
-  digitalWrite(M_A2,HIGH);
-  digitalWrite(M_B1,HIGH);
-  digitalWrite(M_B2,LOW);
-}
-
-void left(unsigned int speed){
-  log("fwd()");
- breakMotor();
- analogWrite(M_ENA_A,speed);
- analogWrite(M_ENA_B,speed);
- digitalWrite(M_A1,HIGH);
-  digitalWrite(M_A2,LOW);
-  digitalWrite(M_B1,HIGH);
-  digitalWrite(M_B2,LOW);
-
-}
-
-void right(unsigned int speed){
-  log("rew()");
- breakMotor();
- analogWrite(M_ENA_A,speed);
- analogWrite(M_ENA_B,speed);
- digitalWrite(M_A1,LOW);
- digitalWrite(M_A2,HIGH);
- digitalWrite(M_B1,LOW);
- digitalWrite(M_B2,HIGH);
-
- 
-}
-
-void ttlEvent(){
-  log("ttlEvent()");
-  breakMotor();
-}
-
-
-void testMotor(){
-  log("TEST fwd ");
-  fwd(100);
-  delay(15000);
-  log("TEST rew");
-  rew(100);
-  delay(15000);
-  log("TEST left");
-  left(150);
-  delay(15000);
-  log("TEST right");
-  right(150);
-  delay(15000);
-
-}
-
-//String action ="";
-//int actionNum =0;
-
-void setup()
-{
+void setup() {
   Serial.begin(115200);//use the hardware serial to communicate with the PC
-  setupWifi();
-  log("Connected");
-  //pinMode(13, OUTPUT);
-  initCar();
-  //testMotor();
-  //digitalWrite(13,HIGH);
+ 
+  //log("Connected");
+  // Attach the Interrupts to their ISR's
+  //digitalPinToInterrupt (MOTOR_A)
+  attachInterrupt(3, ISR_countA, CHANGE);  // Increase counter A when speed sensor pin goes High
+  attachInterrupt(2, ISR_countB, CHANGE);  // Increase counter B when speed sensor pin goes High
+  pinMode(5,OUTPUT);
+  pinMode(6,OUTPUT);
+  pinMode(7,OUTPUT);
+  //test();
+  delay(2000);
+   setupWifi();
+   log("Done");
 }
-bool send =true;
 
-void loop(){
-  //testMotor();
-  //digitalWrite(13,HIGH);
-  
-  if(action.equals("") && send && actionNum < 1024){
-     int pos =getRestAction(actionNum,(uint8_t *)&twenty);
-     //twenty = twenty + pos;
-     action = twenty +pos +'\0';
-     action.remove(action.indexOf("*"),action.length()-action.indexOf("*") );
-     
-     //action = action + '\0';
-     Serial.println("<Loop Action is:" +action +'>');
-     Serial.println("twenty is: " + (char)twenty[13] );
+void loop() {
+  if(action.equals("") && send && 2048 > actionNum  ){
+    //noInterrupts();
+    send =false;
+     int pos =simpleREstAction(actionNum,(uint8_t *)&twenty ); //getRestAction(actionNum,(uint8_t *)&twenty);
+     action = twenty+pos;
+     action =action.substring(0,action.lastIndexOf("$"));
+     //actionin vika merkki on roskaa ja pitää siivota
+    Serial.println("<Loop Action is:" +action +">");
+     //Serial.println("twenty is: " + (char)twenty[13] );
      //Serial.println(action);
-     if(
-      twenty[13]=='n'||
-      twenty[13]=='s' ||
-      twenty[13]=='e' ||
-      twenty[13]=='w' ||
-      twenty[13]=='b' ||
-      twenty[13]=='d' ||
-      twenty[13]=='x' 
-      ){
-        actionNum++;
-        send=false;
-        
-        //if(action.equals("")){
-        //  action = "foo";
-        //}
-        actionStarted = millis();
+    int str_len = action.length() + 1; 
+    char char_array[str_len]; 
+    action.toCharArray(char_array, str_len);
+    char* ptr = strtok(char_array, "/");
+    bool moveTypeStraight=false;
+    bool distanceSpecified=false;
+    bool speedLSpecified=false;
+    bool speedRSpecified=false;
+    bool speedSpecified=false;
+    bool waitSpecified=false;
+    int speed=0,speedL=0,speedR=0,distance=0, waitDur=0;
+    //log("on loop start");
+    while (ptr) {
+      if(strcmp(ptr,"straight")==0){
+        //log("straight -action");
+        moveTypeStraight =true;
+      } else if(strcmp(ptr,"speed")==0){
+        //log("speed -action");
+        speedSpecified =true;
+        ptr = strtok(NULL, "/");
+        speed=atoi(ptr);
+        //Serial.println(ptr);
+        //Serial.print("\r\n");
+        //Serial.print(speed,DEC);
+        //Serial.print("\r\n");
+      } else if(strcmp(ptr,"speedL")==0){
+        //log("speedL -action");
+        moveTypeStraight =false;
+        speedLSpecified =true;
+        ptr = strtok(NULL, "/");
+        speedL=atoi(ptr);
+        Serial.print(speedL,DEC);
+        Serial.print("\r\n");
+      }else if(strcmp(ptr,"speedR")==0){
+        //log("speedR -action");
+        moveTypeStraight =false;
+        speedLSpecified =true;
+        ptr = strtok(NULL, "/");
+        speedR=atoi(ptr);;
+        //Serial.print(speedR,DEC);
+        //Serial.print("\r\n");
+      }else if(strcmp(ptr,"distance")==0){
+        //log("distance-action");
+        distanceSpecified=true;
+        ptr = strtok(NULL, "/");
+        distance=atoi(ptr);
+        //Serial.print(distance,DEC);
+        //Serial.print("\r\n");
+      }else if(strcmp(ptr,"wait")==0){
+        //log("seq-action");
+        waitSpecified=true;
+        ptr = strtok(NULL, "/");
+        waitDur=atoi(ptr);
+      }else if(strcmp(ptr,"halt")==0){
+        //log("seq-action");
+        stopMotors();
+      }else if(strcmp(ptr,"seq")==0){
+        log("seq-action");
+      }else if(strcmp(ptr,"end")==0){
+        log("end-action");
+      }else if(strcmp(ptr,"manual")==0){
+        //log("manual-mode-action");
+        manualMode=true;
+        manualModeStartTime =millis();
+      }else if(strcmp(ptr,"automatic")==0){
+        //log("manual-mode-action");
+        manualMode=false;
+        manualModeStartTime =0;
+      }else {
+        //log("other-action");
+        //log(ptr);
       }
-  }  
-  /*if(Wifly.canReadFromSocket())
-  { 
-    action += (String)Wifly.readFromSocket();
+      ptr = strtok(NULL, "/");
+    }
 
-  }*/
+    
+    //trafficLight();
+    if(moveTypeStraight){
+      if(distance != 0){
+        int steps = CMtoSteps((float)distance);
+        MoveForward(steps,speed);
+        
+      }else{
+        MoveForward(speed);
+      }
+    }else if(speedLSpecified ||speedRSpecified){
+      if(distanceSpecified){
 
-  if(millis() > actionStarted +ACTION_TTL  ){
-    ttlEvent();
-    action = "";
-    send = true;
+        int steps = CMtoSteps((float)distance);
+        moveLRD(speedL,speedR,steps);
+      }else{
+        moveLR(speedL,speedR);
+      }
+    }else if(waitSpecified){
+      waitDur = waitDur>0?:2000;
+      delay(waitDur);
+    }
+  } 
 
-  }
-  
   if(action.endsWith("/seq/end")){
     log("sequence end catched!");
     if(!seqEndReported){
-      postSeqEnd();
-      seqEndReported = true;
+      if( manualMode ==false || millis()>manualModeStartTime+(long)MANUAL_MODE_MAXDUR){
+        postSeqEnd();
+        manualMode=false;
+        seqEndReported = true;
+        actionNum =0;
+      }
     }
     action ="";
     send = true;
-    actionNum =0;
-  } 
-    
+    actionNum = manualMode?actionNum:0;
+    if(!manualMode){
+      delay(500);
+    }
+  } else{
+    actionStarted = millis();
+    seqEndReported =false;
+    //log("------<action:>-------");
+    //log("Action on" +(String)action);
+    //log("-------------------");
+    action="";
+    send=true;
+    actionNum++;  
+  }
+  if(lastDirection >0){
+    bool shouldStop = trafficLight(lastDirection==1,true);
+    if(shouldStop){
+      stopMotors();
+    }
+  }
+  
+  delay(100);
 
-  //strcmp(&twenty +,"/car/fwd")
-  else if(!send && twenty[13]=='n' /*action.endsWith("/fwd*CLOS*")*/){
-    seqEndReported =false;
-    //rampUp(50,100,L1,L3);
-    fwd(170);
-    log("------<action:>-------");
-    log("Action on /car/fwd");
-    log("-------------------");
-    action="";
-    send=true;
-     
-  }
-  else if(!send && twenty[13]=='d'){
-    seqEndReported =false;
-    log("------<action:>-------");
-    log("Action on /car/wait" );
-    log("-------------------");
-    //Wifly.closeAndExit();
-    delay(5000);
-    action="";
-    send=true;   
-  }
-  else if( !send && twenty[13]=='b'){
-    seqEndReported =false;
-    //rampDown(100,0,)
-    breakMotor();
-    log("------<action:>-------");
-    log("Action on /car/stop");
-    log("-------------------");
-    //Wifly.closeAndExit();
-    action="";
-    send=true;
-  }
-  else if( !send && twenty[13]=='s'){
-    seqEndReported =false;
-    //rampUp(0,100,L2,L4);
-    rew(170);
-    log("------<action:>-------");
-    log("Action on /car/rew");
-    log("-------------------");
-    //Wifly.closeAndExit();
-    action="";
-    send=true;
-  }
-  else if( !send && twenty[13]=='w'){
-    seqEndReported =false;
-    left(170);
-    log("------<action:>-------");
-    log("Action on /car/left");
-    log("-------------------");
-    //Wifly.closeAndExit();
-    action="";
-    send=true;
-  }
-  else if( !send && twenty[13]=='e'){
-    seqEndReported =false;
-    right(170);
-    //log("------<action:>-------");
-    log("Action on /light/right");
-    //log("-------------------");
-    //Wifly.closeAndExit();
-    action="";
-    send=true;
-  } else if( !send && twenty[13]=='x'){
-    seqEndReported =false;
-    breakMotor();
-    //digitalWrite(13,LOW);
-    //log("------<action:>-------");
-    log("Action on /seq/end");
-    //log("-------------------");
-    //Wifly.closeAndExit();
-    actionNum =0;
-    action="";
-    send=true;
-  } else {
-    seqEndReported =false;
-    log('Error! no action found');
-  }
-  /*if(Serial.available())
-  {
-    Wifly.print((char)Serial.read());
-  }*/
-  //delay(20000);
-  //delay(1);
 }
+
+void printWiFiStatus() {
+
+  // print the SSID of the network you're attached to:
+
+  Serial.print("SSID: ");
+
+  Serial.println(WiFi.SSID());
+
+  // print your board's IP address:
+
+  IPAddress ip = WiFi.localIP();
+
+  Serial.print("IP Address: ");
+
+  Serial.println(ip);
+
+  // print the received signal strength:
+
+  long rssi = WiFi.RSSI();
+
+  Serial.print("signal strength (RSSI):");
+
+  Serial.print(rssi);
+
+  Serial.println(" dBm");
+}
+
+
